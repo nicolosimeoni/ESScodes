@@ -1,0 +1,1040 @@
+---
+title: "Econometrics Assignment 2"
+format: html
+editor: visual
+---
+
+# 0.1 Preliminary Work
+
+```{r}
+#load packages
+library(forecast)
+library(tseries)
+library(foreign)
+library(readxl)
+library(ggplot2)
+library(strucchange)
+library(vars)
+library(dplyr)
+library(tibble)
+library(readr)
+library(ARDL)
+library(FinTS)
+library(moments)
+library(knitr)
+library(xtable)
+```
+
+```{r}
+#load the dataset
+final_dataset <- read_csv("C:/Users/Stealth/Downloads/final_dataset.csv")
+df_alb_real <- final_dataset[7:35,2]
+```
+
+```{r}
+
+#look for breakpoints
+df_ts <- ts(as.numeric(t(as.matrix(df_alb_real))), start = "1996", frequency = 1)
+plot(df_ts)
+
+bp <- breakpoints(df_ts ~ 1)
+plot(bp)
+summary(bp)
+
+#unit root test 
+adf.test(df_ts)
+
+#training sample
+df_ts_train <- ts(as.numeric(df_ts[1:19]), start = "1996", frequency = 1)
+plot(df_ts_train)
+adf.test(df_ts_train)
+
+```
+
+# 1.1 ARIMA (no breakpoints)
+
+```{r}
+#theil's U
+theils_u <- function(actual, forecast) {
+  # Check inputs
+  if (length(actual) != length(forecast)) {
+    stop("Actual and forecast vectors must be the same length.")
+  }
+  
+  # Remove any NA pairs
+  valid <- complete.cases(actual, forecast)
+  actual <- actual[valid]
+  forecast <- forecast[valid]
+  
+  # Model RMSE
+  rmse_model <- sqrt(mean((forecast - actual)^2))
+  
+  # Naive forecast: lagged actual
+  naive_forecast <- c(NA, head(actual, -1))
+  
+  # Align and remove first NA
+  actual_naive  <- actual[-1]
+  naive_forecast <- naive_forecast[-1]
+  
+  rmse_naive <- sqrt(mean((naive_forecast - actual_naive)^2))
+  
+  # Theil's U
+  u_stat <- rmse_model / rmse_naive
+  return(u_stat)
+}
+
+```
+
+```{r}
+
+#arima
+
+#auto
+auto.arima(df_ts_train)
+#with plots
+acf(df_ts_train, main="ACF of Differenced Series")
+pacf(df_ts_train, main="PACF of Differenced Series")
+
+model <- arima(df_ts_train, order = c(0, 0, 1))
+checkresiduals(model)
+resids <- residuals(model, standardize = TRUE)
+ArchTest(resids, lags = 12)
+summary(model)
+
+h <- 10  # number of years ahead
+fc <- forecast(model, h = h)
+
+#Extract the true out‐of‐sample holds
+start_fc_time <- time(df_ts_train)[length(df_ts_train)] + deltat(df_ts_train)
+true_fc <- window(df_ts, start = start_fc_time, end = start_fc_time + (h - 1) * deltat(df_ts))
+
+#Compute forecast errors
+errors <- true_fc - fc$mean
+MSFE <- mean(errors^2, na.rm = TRUE)
+MAFE <- mean(abs(errors), na.rm = TRUE)
+
+cat("MSFE:", round(MSFE,4), "\n")
+cat("MAFE:", round(MAFE,4), "\n")
+
+u <- theils_u(true_fc, fc$mean)
+cat("Theil's U-statistic:", round(u, 4), "\n")
+
+
+model_results <- data.frame(
+  Model = "ARIMA",
+  MAE = MAFE,
+  RMSE = MSFE,
+  MAPE = "NA",
+  AIC = "NA",
+  BIC = "NA"
+)
+
+
+#Prepare data for ggplot
+orig_df <- data.frame(
+  Year  = as.numeric(time(df_ts)),
+  Value = as.numeric(df_ts)
+)
+fc_df <- data.frame(
+  Year      = as.numeric(time(fc$mean)),
+  Forecast  = as.numeric(fc$mean),
+  Lo80      = as.numeric(fc$lower[,"80%"]),
+  Hi80      = as.numeric(fc$upper[,"80%"]),
+  Lo95      = as.numeric(fc$lower[,"95%"]),
+  Hi95      = as.numeric(fc$upper[,"95%"])
+)
+
+
+# prepare a combined data.frame for easier legend mapping
+plot_df <- bind_rows(
+  orig_df  %>% mutate(Type = "Actual"),
+  fc_df    %>% transmute(Year, Value = Forecast, Type = "Forecast")
+)
+
+
+ggplot(plot_df, aes(x = Year, y = Value, color = Type, linetype = Type)) +
+  # actual vs. forecasted lines
+  geom_line(size = 1) +
+  # 95% forecast interval
+  geom_ribbon(
+    data = fc_df,
+    aes(x = Year, ymin = Lo95, ymax = Hi95),
+    inherit.aes = FALSE,
+    fill = "grey70", alpha = 0.25
+  ) +
+  # manual color & linetype scales
+  scale_color_manual(values = c("Actual" = "black", "Forecast" = "red")) +
+  scale_linetype_manual(values = c("Actual" = "solid", "Forecast" = "dashed")) +
+  # nicer x-axis breaks (integer years)
+  scale_x_continuous(breaks = seq(floor(min(plot_df$Year)), ceiling(max(plot_df$Year)), by = 2)) +
+  labs(
+    title    = "Historical Series and 10-Year MA(1) Forecast",
+    x        = "Year",
+    y        = "Value",
+    caption  = "Forecast interval: 95%"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title          = element_text(face = "bold", size = 16, hjust = 0.5),
+    legend.title        = element_blank(),
+    legend.position     = "bottom",
+    legend.background   = element_rect(fill = "white", colour = "grey80"),
+    panel.grid.major    = element_line(size = 0.5, linetype = "dotted"),
+    panel.grid.minor    = element_blank(),
+    axis.ticks          = element_line(size = 0.5),
+    plot.caption        = element_text(size = 10, hjust = 1)
+  )
+
+```
+
+# 1.2 ARIMA (breakpoints)
+
+```{r}
+#with parameter breaks 
+ts_train <- df_ts_train
+t_train <- time(ts_train)
+break_year <- 1999
+dum_train <- as.numeric(t_train >= break_year)
+model_break <- Arima(ts_train,
+                     order  = c(0,0,1),
+                     xreg   = dum_train,
+                     include.constant = FALSE)
+checkresiduals(model_break)
+
+
+resids <- residuals(model_break, standardize = TRUE)
+ArchTest(resids, lags = 12)
+summary(model_break)
+
+dum_train2 <- rep(1, 10)
+h <- length(df_ts) - length(df_ts_train)
+fc <- forecast(model_break, h = h, xreg = dum_train2)
+
+
+#Extract the true out‐of‐sample holds
+start_fc_time <- time(df_ts_train)[length(df_ts_train)] + deltat(df_ts_train)
+true_fc <- window(df_ts, start = start_fc_time, end = start_fc_time + (h - 1) * deltat(df_ts))
+
+#Compute forecast errors
+errors <- true_fc - fc$mean
+MSFE <- mean(errors^2, na.rm = TRUE)
+MAFE <- mean(abs(errors), na.rm = TRUE)
+
+cat("MSFE:", round(MSFE,4), "\n")
+cat("MAFE:", round(MAFE,4), "\n")
+
+
+u <- theils_u(true_fc, fc$mean)
+cat("Theil's U-statistic:", round(u, 4), "\n")
+
+
+#Prepare data for ggplot
+orig_df <- data.frame(
+  Year  = as.numeric(time(df_ts)),
+  Value = as.numeric(df_ts)
+)
+fc_df <- data.frame(
+  Year      = as.numeric(time(fc$mean)),
+  Forecast  = as.numeric(fc$mean),
+  Lo80      = as.numeric(fc$lower[,"80%"]),
+  Hi80      = as.numeric(fc$upper[,"80%"]),
+  Lo95      = as.numeric(fc$lower[,"95%"]),
+  Hi95      = as.numeric(fc$upper[,"95%"])
+)
+
+
+# prepare a combined data.frame for easier legend mapping
+plot_df <- bind_rows(
+  orig_df  %>% mutate(Type = "Actual"),
+  fc_df    %>% transmute(Year, Value = Forecast, Type = "Forecast")
+)
+
+
+ggplot(plot_df, aes(x = Year, y = Value, color = Type, linetype = Type)) +
+  # actual vs. forecasted lines
+  geom_line(size = 1) +
+  # 95% forecast interval
+  geom_ribbon(
+    data = fc_df,
+    aes(x = Year, ymin = Lo95, ymax = Hi95),
+    inherit.aes = FALSE,
+    fill = "grey70", alpha = 0.25
+  ) +
+  # manual color & linetype scales
+  scale_color_manual(values = c("Actual" = "black", "Forecast" = "red")) +
+  scale_linetype_manual(values = c("Actual" = "solid", "Forecast" = "dashed")) +
+  # nicer x-axis breaks (integer years)
+  scale_x_continuous(breaks = seq(floor(min(plot_df$Year)), ceiling(max(plot_df$Year)), by = 2)) +
+  labs(
+    title    = "Historical Series and 10-Year MA(1) Forecast with Breakpoints",
+    x        = "Year",
+    y        = "Value",
+    caption  = "Forecast interval: 95%"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title          = element_text(face = "bold", size = 16, hjust = 0.5),
+    legend.title        = element_blank(),
+    legend.position     = "bottom",
+    legend.background   = element_rect(fill = "white", colour = "grey80"),
+    panel.grid.major    = element_line(size = 0.5, linetype = "dotted"),
+    panel.grid.minor    = element_blank(),
+    axis.ticks          = element_line(size = 0.5),
+    plot.caption        = element_text(size = 10, hjust = 1)
+  )
+```
+
+# 2.1 Random Walk
+
+```{r}
+#random walk 
+#Fit random‐walk (no drift): ARIMA(0,1,0)
+rw_model <- Arima(df_ts_train, order = c(0, 1, 0), include.constant = FALSE)
+checkresiduals(rw_model)
+ArchTest(residuals(rw_model), lags = 12)
+
+
+#Forecast over the hold‐out
+h     <- length(df_ts) - length(df_ts_train)
+rw_fc <- forecast(rw_model, h = h)
+
+#Extract true out‐of‐sample values
+start_fc_time <- time(df_ts_train)[length(df_ts_train)] + deltat(df_ts_train)
+true_fc       <- window(df_ts, start = start_fc_time)
+
+#Compute errors
+errors <- true_fc - rw_fc$mean
+MSFE   <- mean(errors^2, na.rm = TRUE)
+MAFE   <- mean(abs(errors), na.rm = TRUE)
+cat("MSFE:", round(MSFE,4), "\n")
+cat("MAFE:", round(MAFE,4), "\n")
+
+u <- theils_u(true_fc, rw_fc$mean)
+cat("Theil's U-statistic:", round(u, 4), "\n")
+
+
+#Prepare data.frames for plotting
+orig_df <- data.frame(
+  Year  = as.numeric(time(df_ts)),
+  Value = as.numeric(df_ts)
+)
+fc_df <- data.frame(
+  Year     = as.numeric(time(rw_fc$mean)),
+  Forecast = as.numeric(rw_fc$mean),
+  Lo95     = as.numeric(rw_fc$lower[,"95%"]),
+  Hi95     = as.numeric(rw_fc$upper[,"95%"])
+)
+
+plot_df <- bind_rows(
+  orig_df %>% mutate(Type = "Actual"),
+  fc_df   %>% transmute(Year, Value = Forecast, Type = "Forecast")
+)
+
+#Professional ggplot
+ggplot(plot_df, aes(x = Year, y = Value, color = Type, linetype = Type)) +
+  geom_line(size = 1) +
+  geom_ribbon(
+    data         = fc_df,
+    aes(x = Year, ymin = Lo95, ymax = Hi95),
+    inherit.aes  = FALSE,
+    fill         = "grey70",
+    alpha        = 0.25
+  ) +
+  scale_color_manual(values = c("Actual" = "black", "Forecast" = "red")) +
+  scale_linetype_manual(values = c("Actual" = "solid", "Forecast" = "dashed")) +
+  scale_x_continuous(
+    breaks = seq(
+      floor(min(plot_df$Year)),
+      ceiling(max(plot_df$Year)),
+      by = ifelse(h > 10, 2, 1)
+    )
+  ) +
+  labs(
+    title   = "Historical Series and Random Walk Forecast",
+    x       = "Year",
+    y       = "Value",
+    caption = "95% prediction interval"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title        = element_text(face = "bold", size = 16, hjust = 0.5),
+    legend.title      = element_blank(),
+    legend.position   = "bottom",
+    panel.grid.major  = element_line(size = 0.5, linetype = "dotted"),
+    panel.grid.minor  = element_blank()
+  )
+
+
+#random walk + drift 
+#Fit random‐walk (no drift): ARIMA(0,1,0)
+rw_model2 <- Arima(df_ts_train, order = c(0, 1, 0), include.constant = TRUE)
+checkresiduals(rw_model2)
+ArchTest(residuals(rw_model2), lags = 12)
+
+
+#Forecast over the hold‐out
+h     <- length(df_ts) - length(df_ts_train)
+rw_fc2 <- forecast(rw_model2, h = h)
+
+#Extract true out‐of‐sample values
+start_fc_time <- time(df_ts_train)[length(df_ts_train)] + deltat(df_ts_train)
+true_fc       <- window(df_ts, start = start_fc_time)
+
+#Compute errors
+errors <- true_fc - rw_fc2$mean
+MSFE   <- mean(errors^2, na.rm = TRUE)
+MAFE   <- mean(abs(errors), na.rm = TRUE)
+cat("MSFE:", round(MSFE,4), "\n")
+cat("MAFE:", round(MAFE,4), "\n")
+u <- theils_u(true_fc, rw_fc2$mean)
+cat("Theil's U-statistic:", round(u, 4), "\n")
+
+
+#Prepare data.frames for plotting
+orig_df <- data.frame(
+  Year  = as.numeric(time(df_ts)),
+  Value = as.numeric(df_ts)
+)
+fc_df <- data.frame(
+  Year     = as.numeric(time(rw_fc$mean)),
+  Forecast = as.numeric(rw_fc2$mean),
+  Lo95     = as.numeric(rw_fc2$lower[,"95%"]),
+  Hi95     = as.numeric(rw_fc2$upper[,"95%"])
+)
+
+plot_df <- bind_rows(
+  orig_df %>% mutate(Type = "Actual"),
+  fc_df   %>% transmute(Year, Value = Forecast, Type = "Forecast")
+)
+
+#Professional ggplot
+ggplot(plot_df, aes(x = Year, y = Value, color = Type, linetype = Type)) +
+  geom_line(size = 1) +
+  geom_ribbon(
+    data         = fc_df,
+    aes(x = Year, ymin = Lo95, ymax = Hi95),
+    inherit.aes  = FALSE,
+    fill         = "grey70",
+    alpha        = 0.25
+  ) +
+  scale_color_manual(values = c("Actual" = "black", "Forecast" = "red")) +
+  scale_linetype_manual(values = c("Actual" = "solid", "Forecast" = "dashed")) +
+  scale_x_continuous(
+    breaks = seq(
+      floor(min(plot_df$Year)),
+      ceiling(max(plot_df$Year)),
+      by = ifelse(h > 10, 2, 1)
+    )
+  ) +
+  labs(
+    title   = "Historical Series and Random‐Walk+ drift Forecast",
+    x       = "Year",
+    y       = "Value",
+    caption = "95% prediction interval"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title        = element_text(face = "bold", size = 16, hjust = 0.5),
+    legend.title      = element_blank(),
+    legend.position   = "bottom",
+    panel.grid.major  = element_line(size = 0.5, linetype = "dotted"),
+    panel.grid.minor  = element_blank()
+  )
+```
+
+## 3.1 Unconditional Mean
+
+```{r}
+actual_ts <- df_ts
+train_ts <- df_ts_train
+
+# Forecast next 10 years (2015–2024)
+mean_model <- meanf(train_ts, h = 10, level = c(80, 95))
+
+# Use forecasted levels directly
+forecast_levels <- as.numeric(mean_model$mean)
+lower_80 <- as.numeric(mean_model$lower[, "80%"])
+upper_80 <- as.numeric(mean_model$upper[, "80%"])
+lower_95 <- as.numeric(mean_model$lower[, "95%"])
+upper_95 <- as.numeric(mean_model$upper[, "95%"])
+
+# Forecast years
+forecast_years <- 2015:2024
+
+# Actual values for 2015–2024
+actual_vals <- as.numeric(df_ts[16:25])  # Assuming full levels
+
+# Forecast DataFrame
+df_forecast <- data.frame(
+  Year = forecast_years,
+  Forecast = forecast_levels,
+  Lower80 = lower_80,
+  Upper80 = upper_80,
+  Lower95 = lower_95,
+  Upper95 = upper_95
+)
+
+# Training data (levels): from 2000 to 2014
+df_train <- data.frame(
+  Year = 2000:2014,
+  Value = as.numeric(df_ts[1:15]),
+  Type = "Train"
+)
+
+# Actual values
+df_actual <- data.frame(
+  Year = 2015:2024,
+  Value = actual_vals,
+  Type = "Actual"
+)
+
+# Add last training point to actual for continuity
+df_actual_extended <- rbind(
+  df_train[nrow(df_train), ],
+  df_actual
+)
+
+```
+
+```{r}
+# ---- Plot ----with confidence intervals 
+ggplot() +
+  geom_ribbon(data = df_forecast, aes(x = Year, ymin = Lower95, ymax = Upper95),
+              fill = "grey", alpha = 0.2) +
+  geom_ribbon(data = df_forecast, aes(x = Year, ymin = Lower80, ymax = Upper80),
+              fill = "grey", alpha = 0.4) +
+
+  geom_line(data = df_forecast, aes(x = Year, y = Forecast, color = "Forecast", linetype = "Forecast"), size = 1) +
+  geom_line(data = df_train, aes(x = Year, y = Value, color = "Train"), size = 1) +
+  geom_line(data = df_actual_extended, aes(x = Year, y = Value, color = "Actual"), size = 1) +
+
+  scale_color_manual(values = c("Train" = "black", "Forecast" = "red", "Actual" = "blue")) +
+  scale_linetype_manual(values = c("Forecast" = "dashed")) +
+
+  labs(title = "Forecast vs Actual and Confidence Intervals",
+       y = "CPI Inflation", x = "Year", color = "Series") +
+  theme_minimal()
+
+```
+
+```{r}
+# ---- Plot ----without confidence intervals 
+ggplot() +
+
+  geom_line(data = df_forecast, aes(x = Year, y = Forecast, color = "Forecast", linetype = "Forecast"), size = 1) +
+  geom_line(data = df_train, aes(x = Year, y = Value, color = "Train"), size = 1) +
+  geom_line(data = df_actual_extended, aes(x = Year, y = Value, color = "Actual"), size = 1) +
+
+  scale_color_manual(values = c("Train" = "black", "Forecast" = "red", "Actual" = "blue")) +
+  scale_linetype_manual(values = c("Forecast" = "dashed")) +
+
+  labs(title = "Forecast vs Actual",
+       y = "CPI Inflation", x = "Year", color = "Series") +
+  theme_minimal()
+```
+
+Diagnostic Checks
+
+```{r}
+residuals <- residuals(mean_model)
+checkresiduals(mean_model)
+```
+
+Errors
+
+```{r}
+# Forecast errors
+errors <- actual_vals - forecast_levels
+
+# Metrics
+mae_UM <- mean(abs(errors))
+rmse_UM <- sqrt(mean(errors^2))
+mape_UM <- mean(abs(errors / actual_vals)) * 100
+u <- theils_u(actual_vals, forecast_levels)
+cat("Theil's U-statistic:", round(u, 4), "\n")
+
+cat("MAE:", mae_UM, "\n")
+cat("RMSE:", rmse_UM, "\n")
+cat("MAPE (%):", mape_UM, "\n")
+
+```
+
+## 4.1 ARDL
+
+```{r}
+#load and summarise dataset
+
+# 1. Select only numeric columns
+num_vars <- final_dataset %>% select(where(is.numeric))
+
+# 2. Compute stats for each column
+stats_mat <- sapply(num_vars, function(x) {
+  jb <- jarque.test(x)
+  c(
+    Mean            = mean(x,        na.rm = TRUE),
+    Median          = median(x,      na.rm = TRUE),
+    Maximum         = max(x,         na.rm = TRUE),
+    Minimum         = min(x,         na.rm = TRUE),
+    `Std. Dev.`     = sd(x,          na.rm = TRUE),
+    Skewness        = skewness(x,    na.rm = TRUE),
+    Kurtosis        = kurtosis(x,    na.rm = TRUE),
+    `Jarque-Bera`   = as.numeric(jb$statistic),
+    Probability     = jb$p.value,
+    Sum             = sum(x,         na.rm = TRUE),
+    `Sum Sq. Dev.`  = sum((x - mean(x, na.rm = TRUE))^2, na.rm = TRUE),
+    Observations    = sum(!is.na(x))
+  )
+})
+
+# 3. Turn it into a data.frame with one row per statistic
+stats_df <- as.data.frame(t(stats_mat)) %>%
+  rownames_to_column(var = "Statistic")
+
+# 4a. Option 1: using knitr::kable
+latex_table <- kable(
+  stats_df,
+  format    = "latex",
+  booktabs  = TRUE,
+  digits    = 6,
+  caption   = "Table 1: Summary descriptive statistics"
+)
+
+cat(latex_table)
+
+```
+
+```{r}
+#load the multivariate dataset
+
+datest_diff <- final_dataset  # copy original data frame
+non_stationary_vars <- c()
+
+
+
+for (col in colnames(final_dataset)) {
+  series <- na.omit(final_dataset[[col]])
+  
+  test_result <- tryCatch({
+    adf.test(series)
+  }, error = function(e) {
+    return(NULL)
+  })
+  
+  if (!is.null(test_result) && test_result$p.value > 0.05) {
+    # Mark variable as non-stationary
+    non_stationary_vars <- c(non_stationary_vars, col)
+    
+    # Replace the original variable with its first difference
+    # Note: diff reduces length by 1, so pad with NA at start for alignment
+    diff_series <- c(NA, diff(final_dataset[[col]]))
+    
+    datest_diff[[col]] <- diff_series
+  }
+}
+
+# Now datest_diff contains first differences for non-stationary vars, original for others
+
+non_stationary_after_diff <- c()
+
+for (col in colnames(datest_diff)) {
+  series <- na.omit(datest_diff[[col]])
+  
+  test_result <- tryCatch({
+    adf.test(series)
+  }, error = function(e) {
+    return(NULL)
+  })
+  
+  if (!is.null(test_result) && !is.na(test_result$p.value) && test_result$p.value > 0.05) {
+    non_stationary_after_diff <- c(non_stationary_after_diff, col)
+  }
+}
+
+# Step 2: Difference those variables again in the dataset
+datest_diff2 <- datest_diff  # copy to store second differences
+
+for (col in non_stationary_after_diff) {
+  # Second difference: diff of the first-differenced series
+  diff_series <- c(NA, diff(datest_diff[[col]]))  # pad NA for alignment
+  
+  datest_diff2[[col]] <- diff_series
+}
+
+
+non_stationary_after_second_diff <- c()
+
+for (col in colnames(datest_diff2)) {
+  series <- na.omit(datest_diff2[[col]])
+  
+  test_result <- tryCatch({
+    adf.test(series)
+  }, error = function(e) {
+    return(NULL)
+  })
+  
+  if (!is.null(test_result) && !is.na(test_result$p.value) && test_result$p.value > 0.05) {
+    non_stationary_after_second_diff <- c(non_stationary_after_second_diff, col)
+  }
+}
+
+non_stationary_after_second_diff
+
+stationary_vars <- setdiff(colnames(datest_diff2), non_stationary_after_second_diff)
+stationary_vars
+
+L <- function(x, k) {
+  stats::lag(x, -k)
+}
+
+# Assuming datest_diff2 is already defined and time-ordered (annual)
+data_mult2_train <- datest_diff2[13:25, ]  # Train on 14 years
+data_mult2       <- datest_diff2[13:35, ]  # Full data for evaluation (23 years)
+
+# Convert to time series
+data_ts_train <- ts(data_mult2_train, start = 2002, frequency = 1)
+data_ts_full  <- ts(data_mult2, start = 2002, frequency = 1)
+
+model1 <- auto_ardl(
+  inflation ~ unemp + gdp_growth,
+  data = data_ts_train,
+  max_order = 2,
+  selection = "BIC"
+)
+model1 <- model1$best_model
+#checkresiduals(model1)
+
+newdata <- data_mult2[14:nrow(data_mult2), c("inflation", "unemp", "gdp_growth")]
+
+forecast_values <- predict(model1, newdata = newdata, n.ahead = nrow(newdata))
+print(forecast_values)
+
+actual_values <- data_mult2$inflation[14:nrow(data_mult2)]
+
+# Forecast errors
+errors <- actual_values - forecast_values
+MSFE   <- mean(errors^2, na.rm = TRUE)
+MAFE   <- mean(abs(errors), na.rm = TRUE)
+cat("MSFE:", round(MSFE, 4), "\n")
+cat("MAFE:", round(MAFE, 4), "\n\n")
+u <- theils_u(actual_values, forecast_values)
+cat("Theil's U-statistic:", round(u, 4), "\n")
+
+# 1. Build the “Actual” data.frame
+orig_df <- tibble(
+  Year  = as.numeric(time(data_ts_full)),
+  Value = as.numeric(data_ts_full[, "inflation"]),
+  Type  = "Actual"
+)
+
+# 2. Figure out the forecast years programmatically
+#    (start right after the end of your training sample)
+train_length   <- length(time(data_ts_train))     # e.g. 13 years
+full_years     <- as.numeric(time(data_ts_full))  # e.g. 2000:2022
+forecast_years <- full_years[(train_length + 1):length(full_years)]
+
+# 3. Build the “Forecast” data.frame
+fc_df <- tibble(
+  Year     = forecast_years,
+  Value    = as.numeric(forecast_values),
+  Type     = "Forecast"
+)
+
+# 4. Combine for plotting
+plot_df <- bind_rows(orig_df, fc_df)
+
+# 5. Plot
+ggplot(plot_df, aes(x = Year, y = Value, color = Type, linetype = Type)) +
+  geom_line(size = 1) +
+  # ribbon from 0 up to the forecast line:
+  geom_ribbon(
+    data        = fc_df,
+    aes(x = Year, ymin = 0, ymax = Value),
+    inherit.aes = FALSE,
+    fill        = "grey70",
+    alpha       = 0.25
+  ) +
+  scale_color_manual(values = c(Actual = "black", Forecast = "red")) +
+  scale_linetype_manual(values = c(Actual = "solid", Forecast = "dashed")) +
+  scale_x_continuous(breaks = seq(min(plot_df$Year), max(plot_df$Year), by = 1)) +
+  labs(
+    title   = "Inflation: Actual vs. ARDL Forecast",
+    x       = "Year",
+    y       = "Inflation Rate",
+    caption = "Shaded area: 0 up to forecast"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 16, hjust = 0.5),
+    legend.title     = element_blank(),
+    legend.position  = "bottom",
+    panel.grid.major = element_line(size = 0.5, linetype = "dotted"),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+```{r}
+#model 2
+model2 <- auto_ardl(
+  inflation ~ broad_money + gdp_growth,
+  data = data_ts_train,
+  max_order = 2,
+  selection = "BIC"
+)
+model2 <- model2$best_model
+#checkresiduals(model2)
+
+newdata <- data_mult2[14:nrow(data_mult2), c("inflation", "broad_money", "gdp_growth")]
+
+forecast_values <- predict(model2, newdata = newdata, n.ahead = nrow(newdata))
+print(forecast_values)
+
+actual_values <- data_mult2$inflation[14:nrow(data_mult2)]
+
+# Forecast errors
+errors <- actual_values - forecast_values
+MSFE   <- mean(errors^2, na.rm = TRUE)
+MAFE   <- mean(abs(errors), na.rm = TRUE)
+cat("MSFE:", round(MSFE, 4), "\n")
+cat("MAFE:", round(MAFE, 4), "\n\n")
+u <- theils_u(actual_values, forecast_values)
+cat("Theil's U-statistic:", round(u, 4), "\n")
+
+
+# 1. Build the “Actual” data.frame
+orig_df <- tibble(
+  Year  = as.numeric(time(data_ts_full)),
+  Value = as.numeric(data_ts_full[, "inflation"]),
+  Type  = "Actual"
+)
+
+# 2. Figure out the forecast years programmatically
+#    (start right after the end of your training sample)
+train_length   <- length(time(data_ts_train))     # e.g. 13 years
+full_years     <- as.numeric(time(data_ts_full))  # e.g. 2000:2022
+forecast_years <- full_years[(train_length + 1):length(full_years)]
+
+# 3. Build the “Forecast” data.frame
+fc_df <- tibble(
+  Year     = forecast_years,
+  Value    = as.numeric(forecast_values),
+  Type     = "Forecast"
+)
+
+# 4. Combine for plotting
+plot_df <- bind_rows(orig_df, fc_df)
+
+# 5. Plot
+ggplot(plot_df, aes(x = Year, y = Value, color = Type, linetype = Type)) +
+  geom_line(size = 1) +
+  # ribbon from 0 up to the forecast line:
+  geom_ribbon(
+    data        = fc_df,
+    aes(x = Year, ymin = 0, ymax = Value),
+    inherit.aes = FALSE,
+    fill        = "grey70",
+    alpha       = 0.25
+  ) +
+  scale_color_manual(values = c(Actual = "black", Forecast = "red")) +
+  scale_linetype_manual(values = c(Actual = "solid", Forecast = "dashed")) +
+  scale_x_continuous(breaks = seq(min(plot_df$Year), max(plot_df$Year), by = 1)) +
+  labs(
+    title   = "Inflation: Actual vs. ARDL Forecast",
+    x       = "Year",
+    y       = "Inflation Rate",
+    caption = "Shaded area: 0 up to forecast"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 16, hjust = 0.5),
+    legend.title     = element_blank(),
+    legend.position  = "bottom",
+    panel.grid.major = element_line(size = 0.5, linetype = "dotted"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r}
+model3 <- auto_ardl(
+  inflation ~ ea_real_gdp + current_account + euribor_3m_rate,
+  data = data_ts_train,
+  max_order = 1,
+  selection = "BIC"
+)
+model3 <- model3$best_model
+#checkresiduals(model3)
+
+newdata <- data_mult2[14:nrow(data_mult2), c("inflation", "ea_real_gdp","current_account", "euribor_3m_rate")]
+
+forecast_values <- predict(model3, newdata = newdata, n.ahead = nrow(newdata))
+print(forecast_values)
+
+actual_values <- data_mult2$inflation[14:nrow(data_mult2)]
+
+# Forecast errors
+errors <- actual_values - forecast_values
+MSFE   <- mean(errors^2, na.rm = TRUE)
+MAFE   <- mean(abs(errors), na.rm = TRUE)
+cat("MSFE:", round(MSFE, 4), "\n")
+cat("MAFE:", round(MAFE, 4), "\n\n")
+u <- theils_u(actual_values, forecast_values)
+cat("Theil's U-statistic:", round(u, 4), "\n")
+
+
+# 1. Build the “Actual” data.frame
+orig_df <- tibble(
+  Year  = as.numeric(time(data_ts_full)),
+  Value = as.numeric(data_ts_full[, "inflation"]),
+  Type  = "Actual"
+)
+
+# 2. Figure out the forecast years programmatically
+#    (start right after the end of your training sample)
+train_length   <- length(time(data_ts_train))     # e.g. 13 years
+full_years     <- as.numeric(time(data_ts_full))  # e.g. 2000:2022
+forecast_years <- full_years[(train_length + 1):length(full_years)]
+
+# 3. Build the “Forecast” data.frame
+fc_df <- tibble(
+  Year     = forecast_years,
+  Value    = as.numeric(forecast_values),
+  Type     = "Forecast"
+)
+
+# 4. Combine for plotting
+plot_df <- bind_rows(orig_df, fc_df)
+
+# 5. Plot
+ggplot(plot_df, aes(x = Year, y = Value, color = Type, linetype = Type)) +
+  geom_line(size = 1) +
+  # ribbon from 0 up to the forecast line:
+  geom_ribbon(
+    data        = fc_df,
+    aes(x = Year, ymin = 0, ymax = Value),
+    inherit.aes = FALSE,
+    fill        = "grey70",
+    alpha       = 0.25
+  ) +
+  scale_color_manual(values = c(Actual = "black", Forecast = "red")) +
+  scale_linetype_manual(values = c(Actual = "solid", Forecast = "dashed")) +
+  scale_x_continuous(breaks = seq(min(plot_df$Year), max(plot_df$Year), by = 1)) +
+  labs(
+    title   = "Inflation: Actual vs. ARDL Forecast",
+    x       = "Year",
+    y       = "Inflation Rate",
+    caption = "Shaded area: 0 up to forecast"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 16, hjust = 0.5),
+    legend.title     = element_blank(),
+    legend.position  = "bottom",
+    panel.grid.major = element_line(size = 0.5, linetype = "dotted"),
+    panel.grid.minor = element_blank()
+  )
+
+
+#test for heteroskedaticity of residuals for all models
+ArchTest(residuals(model1), lags = 6)
+ArchTest(residuals(model2), lags = 6)
+ArchTest(residuals(model3), lags = 6)
+
+```
+
+## 5.1 Benchmark AR(2)
+
+```{r}
+# --- Prepare data ---
+ts_train <- df_ts_train
+t_train <- time(ts_train)
+
+# Structural break dummy (e.g., break in 1999)
+break_year <- 1999
+dum_train <- as.numeric(t_train >= break_year)
+
+# --- Fit AR(2) model with structural break dummy ---
+model_break <- Arima(ts_train,
+                     order  = c(2, 0, 0),          # AR(2) model
+                     xreg   = dum_train,
+                     include.constant = FALSE)
+
+checkresiduals(model_break)
+
+# --- ARCH test on residuals ---
+resids <- residuals(model_break, standardize = TRUE)
+ArchTest(resids, lags = 12)
+summary(model_break)
+
+# --- Forecasting ---
+
+# Create future dummy variable values (for 10-year forecast)
+h <- length(df_ts) - length(df_ts_train)
+dum_train2 <- rep(1, h)  # Because all future periods are after the break
+
+fc <- forecast(model_break, h = h, xreg = dum_train2)
+
+# --- Extract true values ---
+start_fc_time <- time(df_ts_train)[length(df_ts_train)] + deltat(df_ts_train)
+true_fc <- window(df_ts, start = start_fc_time, end = start_fc_time + (h - 1) * deltat(df_ts))
+
+# --- Forecast errors ---
+errors <- true_fc - fc$mean
+MSFE <- mean(errors^2, na.rm = TRUE)
+MAFE <- mean(abs(errors), na.rm = TRUE)
+
+cat("MSFE:", round(MSFE, 4), "\n")
+cat("MAFE:", round(MAFE, 4), "\n")
+
+u <- theils_u(true_fc, fc$mean)
+cat("Theil's U-statistic:", round(u, 4), "\n")
+
+# --- Plotting data preparation ---
+orig_df <- data.frame(
+  Year  = as.numeric(time(df_ts)),
+  Value = as.numeric(df_ts)
+)
+
+fc_df <- data.frame(
+  Year      = as.numeric(time(fc$mean)),
+  Forecast  = as.numeric(fc$mean),
+  Lo80      = as.numeric(fc$lower[, "80%"]),
+  Hi80      = as.numeric(fc$upper[, "80%"]),
+  Lo95      = as.numeric(fc$lower[, "95%"]),
+  Hi95      = as.numeric(fc$upper[, "95%"])
+)
+
+plot_df <- bind_rows(
+  orig_df %>% mutate(Type = "Actual"),
+  fc_df   %>% transmute(Year, Value = Forecast, Type = "Forecast")
+)
+
+# --- Plot ---
+ggplot(plot_df, aes(x = Year, y = Value, color = Type, linetype = Type)) +
+  geom_line(size = 1) +
+  geom_ribbon(
+    data = fc_df,
+    aes(x = Year, ymin = Lo95, ymax = Hi95),
+    inherit.aes = FALSE,
+    fill = "grey70", alpha = 0.25
+  ) +
+  scale_color_manual(values = c("Actual" = "black", "Forecast" = "red")) +
+  scale_linetype_manual(values = c("Actual" = "solid", "Forecast" = "dashed")) +
+  scale_x_continuous(breaks = seq(floor(min(plot_df$Year)), ceiling(max(plot_df$Year)), by = 2)) +
+  labs(
+    title    = "Historical Series and 10-Year AR(2) Forecast with Structural Break",
+    x        = "Year",
+    y        = "Value",
+    caption  = "Forecast interval: 95%"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title          = element_text(face = "bold", size = 16, hjust = 0.5),
+    legend.title        = element_blank(),
+    legend.position     = "bottom",
+    legend.background   = element_rect(fill = "white", colour = "grey80"),
+    panel.grid.major    = element_line(size = 0.5, linetype = "dotted"),
+    panel.grid.minor    = element_blank(),
+    axis.ticks          = element_line(size = 0.5),
+    plot.caption        = element_text(size = 10, hjust = 1)
+  )
+```
